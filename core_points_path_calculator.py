@@ -14,8 +14,76 @@ import os
 import re
 import ast
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from AStar.grid_based_a_star import GridBasedAStar
+from grid_processing.cost_calculator import CostCalculator
 from paths import DATA_DIR
+
+
+DEFAULT_ALL_PAIRS_WORKER_CAP = 12
+
+# 进程池 worker 本地缓存（initializer 写入）
+_ALL_PAIRS_WORKER = {"planner": None, "points": None}
+
+
+def _cost_calculator_to_kwargs(cost_calculator) -> dict:
+    """将 CostCalculator 转为可 pickle 的构造参数。"""
+    return {
+        "base_water_cost": getattr(cost_calculator, "base_water_cost", 1.0),
+        "land_cost": getattr(cost_calculator, "land_cost", 10.0),
+        "outside_boundary_cost": getattr(cost_calculator, "outside_boundary_cost", 100.0),
+        "takeoff_penalty": getattr(cost_calculator, "takeoff_penalty", 10.0),
+        "landing_penalty": getattr(cost_calculator, "landing_penalty", 5.0),
+    }
+
+
+def _init_all_pairs_worker(grid_data, cost_kwargs, points):
+    """每个 worker 进程只构建一次 A* 规划器。"""
+    cost_calculator = CostCalculator(**cost_kwargs)
+    _ALL_PAIRS_WORKER["planner"] = GridBasedAStar(grid_data, cost_calculator)
+    _ALL_PAIRS_WORKER["points"] = points
+
+
+def _process_pair_chunk(pair_list):
+    """
+    处理一批点对 (i, j)。
+    返回 [(i, j, success, cost, distance, path, error), ...]
+    """
+    planner = _ALL_PAIRS_WORKER["planner"]
+    points = _ALL_PAIRS_WORKER["points"]
+    results = []
+    for i, j in pair_list:
+        point_i = points[i]["point"]
+        point_j = points[j]["point"]
+        path_result = planner.plan(
+            point_i[0], point_i[1],
+            point_j[0], point_j[1],
+        )
+        if path_result["success"]:
+            results.append((
+                i, j, True,
+                path_result["cost"],
+                path_result["distance"],
+                path_result["path"],
+                None,
+            ))
+        else:
+            results.append((
+                i, j, False,
+                None, None, None,
+                path_result.get("error", "未知错误"),
+            ))
+    return results
+
+
+def _split_pairs_into_chunks(n, num_chunks):
+    """将全部 (i,j) i<j 均分成约 num_chunks 个 chunk。"""
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    if not pairs:
+        return []
+    num_chunks = max(1, min(num_chunks, len(pairs)))
+    chunk_size = (len(pairs) + num_chunks - 1) // num_chunks
+    return [pairs[k:k + chunk_size] for k in range(0, len(pairs), chunk_size)]
 
 
 def merge_core_points(no_hole_points, with_hole_points):
@@ -51,98 +119,122 @@ def merge_core_points(no_hole_points, with_hole_points):
     return merged_points
 
 
-def calculate_all_pairs_paths(merged_points, grid_data, cost_calculator, save_path='core_points_all_pairs_paths.txt'):
+def calculate_all_pairs_paths(
+    merged_points,
+    grid_data,
+    cost_calculator,
+    save_path='core_points_all_pairs_paths.txt',
+    use_parallel=True,
+    max_workers=None,
+):
     """
-    计算所有点对之间的最优路径和成本，并保存到文件
-    
+    计算所有点对之间的最优路径和成本，并保存到文件。
+
     :param merged_points: 合并后的核心点列表
     :param grid_data: 栅格数据
     :param cost_calculator: 成本计算器
     :param save_path: 保存文件路径
+    :param use_parallel: 是否使用进程池分块并行
+    :param max_workers: worker 数；None => min(cpu_count(), 12)
     :return: 成本矩阵和路径字典
     """
     n = len(merged_points)
     if n == 0:
         print("  错误: 没有核心点可计算")
         return None, None
-    
+
+    total_pairs = n * (n - 1) // 2
     print(f"  总核心点数: {n}")
-    print(f"  需要计算的点对数量: {n * (n - 1) // 2}")
-    
-    # 初始化A*规划器
-    a_star_planner = GridBasedAStar(grid_data, cost_calculator)
-    
-    # 初始化成本矩阵（对称矩阵）
+    print(f"  需要计算的点对数量: {total_pairs}")
+
     cost_matrix = np.full((n, n), np.inf)
     distance_matrix = np.full((n, n), np.inf)
-    
-    # 存储所有路径（可选，如果内存允许）
     paths_dict = {}
     failed_pairs = []
-    
-    # 计算所有点对（i < j）
-    total_pairs = n * (n - 1) // 2
     calculated = 0
     start_time = time.time()
-    
-    print(f"  开始计算所有点对路径...")
-    
-    for i in range(n):
-        for j in range(i + 1, n):
-            point_i = merged_points[i]['point']
-            point_j = merged_points[j]['point']
-            
-            # 计算路径
-            path_result = a_star_planner.plan(
-                point_i[0], point_i[1],
-                point_j[0], point_j[1]
+
+    def _record(i, j, success, cost, distance, path, error):
+        nonlocal calculated
+        calculated += 1
+        if success:
+            cost_matrix[i, j] = cost_matrix[j, i] = cost
+            distance_matrix[i, j] = distance_matrix[j, i] = distance
+            paths_dict[f"{i}->{j}"] = {
+                "cost": cost,
+                "distance": distance,
+                "path": path,
+                "path_length": len(path) if path is not None else 0,
+                "from_info": merged_points[i],
+                "to_info": merged_points[j],
+            }
+        else:
+            failed_pairs.append((i, j, error or "未知错误"))
+
+        if calculated % max(1, total_pairs // 20) == 0 or calculated == total_pairs:
+            elapsed = time.time() - start_time
+            progress = calculated / total_pairs * 100 if total_pairs else 100.0
+            avg_time = elapsed / calculated if calculated > 0 else 0.0
+            remaining = (total_pairs - calculated) * avg_time
+            print(
+                f"    进度: {calculated}/{total_pairs} ({progress:.1f}%) | "
+                f"已用时间: {elapsed:.1f}s | 预计剩余: {remaining:.1f}s"
             )
-            
-            if path_result['success']:
-                cost = path_result['cost']
-                distance = path_result['distance']
-                
-                # 填充对称矩阵
-                cost_matrix[i, j] = cost
-                cost_matrix[j, i] = cost
-                distance_matrix[i, j] = distance
-                distance_matrix[j, i] = distance
-                
-                # 保存路径信息
-                paths_dict[f"{i}->{j}"] = {
-                    'cost': cost,
-                    'distance': distance,
-                    'path': path_result['path'],
-                    'path_length': len(path_result['path']),
-                    'from_info': merged_points[i],
-                    'to_info': merged_points[j]
-                }
-            else:
-                # 路径规划失败
-                failed_pairs.append((i, j, path_result.get('error', '未知错误')))
-            
-            # 更新进度
-            calculated += 1
-            if calculated % max(1, total_pairs // 20) == 0 or calculated == total_pairs:
-                elapsed = time.time() - start_time
-                progress = calculated / total_pairs * 100
-                if calculated > 0:
-                    avg_time = elapsed / calculated
-                    remaining = (total_pairs - calculated) * avg_time
-                    print(f"    进度: {calculated}/{total_pairs} ({progress:.1f}%) | "
-                          f"已用时间: {elapsed:.1f}s | 预计剩余: {remaining:.1f}s")
-    
+
+    use_pool = use_parallel and total_pairs > 1
+    if use_pool:
+        workers = max_workers or min(os.cpu_count() or 1, DEFAULT_ALL_PAIRS_WORKER_CAP)
+        workers = max(1, min(workers, total_pairs))
+        num_chunks = max(workers * 4, workers)
+        chunks = _split_pairs_into_chunks(n, num_chunks)
+        print(
+            f"  开始计算所有点对路径（并行，workers={workers}, chunks={len(chunks)}）"
+        )
+        cost_kwargs = _cost_calculator_to_kwargs(cost_calculator)
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_all_pairs_worker,
+            initargs=(grid_data, cost_kwargs, merged_points),
+        ) as executor:
+            futures = [executor.submit(_process_pair_chunk, chunk) for chunk in chunks]
+            for fut in as_completed(futures):
+                for item in fut.result():
+                    _record(*item)
+    else:
+        print(f"  开始计算所有点对路径...")
+        a_star_planner = GridBasedAStar(grid_data, cost_calculator)
+        for i in range(n):
+            for j in range(i + 1, n):
+                point_i = merged_points[i]['point']
+                point_j = merged_points[j]['point']
+                path_result = a_star_planner.plan(
+                    point_i[0], point_i[1],
+                    point_j[0], point_j[1]
+                )
+                if path_result['success']:
+                    _record(
+                        i, j, True,
+                        path_result['cost'],
+                        path_result['distance'],
+                        path_result['path'],
+                        None,
+                    )
+                else:
+                    _record(
+                        i, j, False, None, None, None,
+                        path_result.get('error', '未知错误'),
+                    )
+
     total_time = time.time() - start_time
     print(f"  ✓ 计算完成！总耗时: {total_time:.2f}秒")
-    
+
     if failed_pairs:
         print(f"  ⚠ 警告: {len(failed_pairs)} 对点无法找到路径")
-        for i, j, error in failed_pairs[:5]:  # 只显示前5个
+        for i, j, error in failed_pairs[:5]:
             print(f"    点对 ({i}, {j}): {error}")
         if len(failed_pairs) > 5:
             print(f"    ... 还有 {len(failed_pairs) - 5} 对失败的点对")
-    
-    # 保存到文件
+
     try:
         save_all_pairs_results(merged_points, cost_matrix, distance_matrix, paths_dict, save_path)
         print(f"  ✓ 文件保存成功！")
@@ -150,7 +242,7 @@ def calculate_all_pairs_paths(merged_points, grid_data, cost_calculator, save_pa
         print(f"  ✗ 文件保存失败: {e}")
         import traceback
         traceback.print_exc()
-    
+
     return cost_matrix, paths_dict
 
 

@@ -18,9 +18,9 @@ from core_points_path_calculator import (
     load_tsp_tour_from_file
 )
 from lkh_solver import solve_tsp_with_lkh
-from shapely.geometry import Polygon, LineString, Point
 from water_coverage_processor import (
-    process_water_block_coverage,
+    build_coverage_block_jobs,
+    run_coverage_blocks,
     load_coverage_paths_from_files,
     COVERAGE_PATHS_SUBDIR,
 )
@@ -64,6 +64,17 @@ if __name__ == "__main__":
     Y_SCALE_FACTOR = 1.0     # Y 方向缩放（沿起点→终点）
     # LKH 水域块内 TSP 求解参数：RUNS 越大解越优、耗时越长；越小求解越快、解可能略差
     LKH_RUNS = 1            # PAR 文件中的 RUNS（默认 2：速度优先；可改为 10 等提高质量）
+
+    # =============================================================================
+    # 并行计算开关（CPU 多进程；默认 workers = min(cpu_count(), 12)）
+    # =============================================================================
+    # 一期：块级覆盖路径
+    USE_PARALLEL_COVERAGE = True
+    COVERAGE_WORKERS = None          # None = min(cpu_count(), 12)
+    # 二期：全点对 A*
+    USE_PARALLEL_ALL_PAIRS = True
+    ALL_PAIRS_WORKERS = None         # None = min(cpu_count(), 12)
+
     t_start = time.perf_counter()
     
     # 1. 加载环境对象
@@ -121,12 +132,14 @@ if __name__ == "__main__":
         if len(merged_points) < 2:
             print("  - 核心点数量不足（至少需要2个点）")
         else:
-            # 计算所有点对
+            # 计算所有点对（可选进程池分块并行）
             cost_matrix, paths_dict = calculate_all_pairs_paths(
-                merged_points, 
-                grid_data, 
+                merged_points,
+                grid_data,
                 cost_calculator,
-                save_path='core_points_all_pairs_paths.txt'
+                save_path='core_points_all_pairs_paths.txt',
+                use_parallel=USE_PARALLEL_ALL_PAIRS,
+                max_workers=ALL_PAIRS_WORKERS,
             )
             
             if cost_matrix is not None:
@@ -254,76 +267,32 @@ if __name__ == "__main__":
             degenerate_threshold = float(np.sqrt((e50[0] - s50[0]) ** 2 + (e50[1] - s50[1]) ** 2))
         else:
             degenerate_threshold = 1.0
-        print(f"\n5.4. 重新计算前 {N} 块覆盖路径，写入 {coverage_paths_dir} ...")
+        mode_label = "并行" if USE_PARALLEL_COVERAGE else "串行"
+        print(f"\n5.4. 重新计算前 {N} 块覆盖路径（{mode_label}），写入 {coverage_paths_dir} ...")
         print(f"  [阈值] 起点/终点视为同一点的距离阈值 = {degenerate_threshold:.4f} m（以块50起退点距离为准则）")
-        for block_no in range(1, N + 1):
-            i = block_no - 1
-            point_idx = tour_order[i]
-            if point_idx >= len(merged_points):
-                continue
-            point_info = merged_points[point_idx]
-            water_idx = point_info.get("water_idx")
-            water_type = point_info.get("type")
-            water_info = None
-            if water_type == "no_hole":
-                for w in water_no_hole:
-                    if w.get("idx") == water_idx:
-                        water_info = w
-                        break
-            elif water_type == "with_hole":
-                for w in water_with_hole:
-                    if w.get("idx") == water_idx:
-                        water_info = w
-                        break
-            if not water_info:
-                continue
-            water_poly = Polygon(water_info["outer"], holes=water_info.get("holes", []))
-            # 聚类水域块：采样范围应为「聚类凸包∩水域」（红虚线区域），不是整片水域
-            coverage_poly = water_poly
-            if water_type == "with_hole" and core_points_data:
-                clusters_map = core_points_data.get("water_with_hole_clusters", {})
-                if water_idx in clusters_map:
-                    current_pt = merged_points[point_idx].get("point")
-                    if current_pt is not None:
-                        for cluster in clusters_map[water_idx]:
-                            hull_coords = cluster.get("hull")
-                            if hull_coords and len(hull_coords) >= 3:
-                                try:
-                                    hull_poly = Polygon(hull_coords)
-                                    if not hull_poly.is_empty and hull_poly.contains(Point(current_pt[0], current_pt[1])):
-                                        inter = hull_poly.intersection(water_poly)
-                                        if not inter.is_empty:
-                                            coverage_poly = inter.geoms[0] if inter.geom_type == "MultiPolygon" and len(inter.geoms) > 0 else inter
-                                            if coverage_poly.geom_type != "Polygon":
-                                                coverage_poly = water_poly
-                                        break
-                                except Exception:
-                                    continue
-            entry_exit = all_water_entry_exit.get(block_no, {})
-            start_pt = entry_exit.get("start_point")
-            exit_pt = entry_exit.get("exit_point")
-            if start_pt is None or exit_pt is None:
-                print(f"  [跳过] 第{block_no}块：起点或终点缺失")
-                continue
-            _, sp, tour, _ = process_water_block_coverage(
-                block_no=block_no,
-                water_info=water_info,
-                water_poly=coverage_poly,
-                start_point=start_pt,
-                exit_point=exit_pt,
-                grid_data=grid_data,
-                env_data=env_data,
-                coverage_paths_dir=coverage_paths_dir,
-                skip_sampling_and_path=False,
-                fill_spacing=FILL_SPACING,
-                x_scale_factor=X_SCALE_FACTOR,
-                y_scale_factor=Y_SCALE_FACTOR,
-                degenerate_threshold=degenerate_threshold,
-                lkh_runs=LKH_RUNS,
-            )
-            # 只要有采样点就加入，便于可视化；LKH 失败时 tour 为 None，仍可画采样点
-            if sp is not None:
-                all_blocks_coverage_paths[block_no] = {"sampling_points": sp, "tour_order": tour}
+        jobs = build_coverage_block_jobs(
+            n_blocks=N,
+            tour_order=tour_order,
+            merged_points=merged_points,
+            water_no_hole=water_no_hole,
+            water_with_hole=water_with_hole,
+            core_points_data=core_points_data,
+            all_water_entry_exit=all_water_entry_exit,
+            grid_data=grid_data,
+            env_data=env_data,
+            coverage_paths_dir=coverage_paths_dir,
+            fill_spacing=FILL_SPACING,
+            x_scale_factor=X_SCALE_FACTOR,
+            y_scale_factor=Y_SCALE_FACTOR,
+            degenerate_threshold=degenerate_threshold,
+            lkh_runs=LKH_RUNS,
+            quiet=USE_PARALLEL_COVERAGE,
+        )
+        all_blocks_coverage_paths = run_coverage_blocks(
+            jobs,
+            use_parallel=USE_PARALLEL_COVERAGE,
+            max_workers=COVERAGE_WORKERS,
+        )
         if 1 in all_blocks_coverage_paths:
             first_block_sampling_points = all_blocks_coverage_paths[1].get("sampling_points")
             first_block_coverage_tour = all_blocks_coverage_paths[1].get("tour_order")

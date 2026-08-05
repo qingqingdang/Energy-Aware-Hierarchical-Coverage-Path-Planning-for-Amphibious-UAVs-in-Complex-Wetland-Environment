@@ -7,12 +7,16 @@
 3. 生成TSP和PAR文件
 4. 调用LKH求解器
 5. 处理求解结果并写入 data/coverage_paths/block_XX_coverage_path.txt
+
+支持块级多进程并行（ProcessPoolExecutor）。
 """
 
 import os
+import time
 import numpy as np
-from typing import Dict, List, Optional, Tuple
-from shapely.geometry import Polygon
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
+from shapely.geometry import Polygon, Point
 from water_coverage import generate_water_sampling_points
 from water_cost_matrix import calculate_sampling_points_cost_matrix
 from water_tsp_generator import generate_water_tsp_files
@@ -25,6 +29,222 @@ COVERAGE_PATHS_SUBDIR = "coverage_paths"
 
 # 覆盖路径结果文件名模式：block_XX_coverage_path.txt
 COVERAGE_PATH_FILENAME_PATTERN = "block_{:02d}_coverage_path.txt"
+
+# 块级并行默认 worker 上限
+DEFAULT_COVERAGE_WORKER_CAP = 12
+
+
+def _resolve_coverage_polygon(
+    water_info: Dict,
+    water_type: str,
+    water_idx: Any,
+    point_info: Dict,
+    core_points_data: Optional[Dict],
+) -> Polygon:
+    """
+    无孔水域用整块多边形；有孔聚类水域用「凸包 ∩ 水域」。
+    """
+    water_poly = Polygon(water_info["outer"], holes=water_info.get("holes", []))
+    coverage_poly = water_poly
+    if water_type == "with_hole" and core_points_data:
+        clusters_map = core_points_data.get("water_with_hole_clusters", {})
+        if water_idx in clusters_map:
+            current_pt = point_info.get("point")
+            if current_pt is not None:
+                for cluster in clusters_map[water_idx]:
+                    hull_coords = cluster.get("hull")
+                    if hull_coords and len(hull_coords) >= 3:
+                        try:
+                            hull_poly = Polygon(hull_coords)
+                            if not hull_poly.is_empty and hull_poly.contains(
+                                Point(current_pt[0], current_pt[1])
+                            ):
+                                inter = hull_poly.intersection(water_poly)
+                                if not inter.is_empty:
+                                    coverage_poly = (
+                                        inter.geoms[0]
+                                        if inter.geom_type == "MultiPolygon" and len(inter.geoms) > 0
+                                        else inter
+                                    )
+                                    if coverage_poly.geom_type != "Polygon":
+                                        coverage_poly = water_poly
+                                break
+                        except Exception:
+                            continue
+    return coverage_poly
+
+
+def build_coverage_block_jobs(
+    n_blocks: int,
+    tour_order: List[int],
+    merged_points: List[Dict],
+    water_no_hole: List[Dict],
+    water_with_hole: List[Dict],
+    core_points_data: Optional[Dict],
+    all_water_entry_exit: Dict[int, Dict],
+    grid_data: Dict,
+    env_data: Dict,
+    coverage_paths_dir: str,
+    fill_spacing: float = 4.0,
+    x_scale_factor: float = 0.85,
+    y_scale_factor: float = 1.0,
+    degenerate_threshold: float = 1.0,
+    lkh_runs: int = 10,
+    quiet: bool = False,
+) -> List[Dict]:
+    """
+    组装各水域块覆盖路径任务列表（起点/终点缺失的块跳过，不入队）。
+    """
+    jobs = []
+    for block_no in range(1, n_blocks + 1):
+        i = block_no - 1
+        if i >= len(tour_order):
+            continue
+        point_idx = tour_order[i]
+        if point_idx >= len(merged_points):
+            continue
+        point_info = merged_points[point_idx]
+        water_idx = point_info.get("water_idx")
+        water_type = point_info.get("type")
+        water_info = None
+        if water_type == "no_hole":
+            for w in water_no_hole:
+                if w.get("idx") == water_idx:
+                    water_info = w
+                    break
+        elif water_type == "with_hole":
+            for w in water_with_hole:
+                if w.get("idx") == water_idx:
+                    water_info = w
+                    break
+        if not water_info:
+            continue
+
+        coverage_poly = _resolve_coverage_polygon(
+            water_info, water_type, water_idx, point_info, core_points_data
+        )
+        entry_exit = all_water_entry_exit.get(block_no, {})
+        start_pt = entry_exit.get("start_point")
+        exit_pt = entry_exit.get("exit_point")
+        if start_pt is None or exit_pt is None:
+            print(f"  [跳过] 第{block_no}块：起点或终点缺失")
+            continue
+
+        jobs.append({
+            "block_no": block_no,
+            "water_info": water_info,
+            "water_poly": coverage_poly,
+            "start_point": start_pt,
+            "exit_point": exit_pt,
+            "grid_data": grid_data,
+            "env_data": env_data,
+            "coverage_paths_dir": coverage_paths_dir,
+            "fill_spacing": fill_spacing,
+            "x_scale_factor": x_scale_factor,
+            "y_scale_factor": y_scale_factor,
+            "degenerate_threshold": degenerate_threshold,
+            "lkh_runs": lkh_runs,
+            "verbose": not quiet,
+        })
+    return jobs
+
+
+def process_coverage_block_job(job: Dict) -> Dict:
+    """模块级 worker：处理单个覆盖路径任务（可被 ProcessPoolExecutor pickle）。"""
+    block_no = job["block_no"]
+    t0 = time.perf_counter()
+    error = None
+    sampling_points = None
+    tour_order = None
+    try:
+        _, sampling_points, tour_order, _ = process_water_block_coverage(
+            block_no=block_no,
+            water_info=job["water_info"],
+            water_poly=job["water_poly"],
+            start_point=job["start_point"],
+            exit_point=job["exit_point"],
+            grid_data=job["grid_data"],
+            env_data=job["env_data"],
+            coverage_paths_dir=job["coverage_paths_dir"],
+            skip_sampling_and_path=False,
+            fill_spacing=job.get("fill_spacing", 4.0),
+            x_scale_factor=job.get("x_scale_factor", 0.85),
+            y_scale_factor=job.get("y_scale_factor", 1.0),
+            degenerate_threshold=job.get("degenerate_threshold", 1.0),
+            lkh_runs=job.get("lkh_runs", 10),
+            verbose=job.get("verbose", True),
+        )
+    except Exception as e:
+        error = str(e)
+    return {
+        "block_no": block_no,
+        "sampling_points": sampling_points,
+        "tour_order": tour_order,
+        "elapsed": time.perf_counter() - t0,
+        "error": error,
+    }
+
+
+def run_coverage_blocks(
+    jobs: List[Dict],
+    use_parallel: bool = True,
+    max_workers: Optional[int] = None,
+) -> Dict[int, Dict]:
+    """
+    串行或进程池执行覆盖路径任务。
+    返回 {block_no: {sampling_points, tour_order}}（有采样点即收录）。
+    """
+    results = {}
+    if not jobs:
+        print("  [覆盖路径] 无有效任务")
+        return results
+
+    n = len(jobs)
+    t0 = time.perf_counter()
+
+    def _collect(res: Dict):
+        bn = res["block_no"]
+        if res.get("error"):
+            print(f"  ⚠ 第{bn}块异常: {res['error']}")
+        if res.get("sampling_points") is not None:
+            results[bn] = {
+                "sampling_points": res["sampling_points"],
+                "tour_order": res.get("tour_order"),
+            }
+
+    if (not use_parallel) or n <= 1:
+        mode = "串行"
+        print(f"[覆盖路径] {mode}处理 {n} 块")
+        for job in jobs:
+            res = process_coverage_block_job(job)
+            _collect(res)
+            done = len(results)
+            print(
+                f"[进度] {done}/{n} 完成块 {res['block_no']} "
+                f"({res['elapsed']:.1f}s)"
+            )
+    else:
+        workers = max_workers or min(os.cpu_count() or 1, DEFAULT_COVERAGE_WORKER_CAP)
+        workers = max(1, min(workers, n))
+        print(
+            f"[覆盖路径] 并行处理 {n} 块，workers={workers} "
+            f"(cpu_count={os.cpu_count()})"
+        )
+        completed = 0
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(process_coverage_block_job, job): job for job in jobs}
+            for fut in as_completed(futures):
+                res = fut.result()
+                _collect(res)
+                completed += 1
+                print(
+                    f"[进度] {completed}/{n} 完成块 {res['block_no']} "
+                    f"({res['elapsed']:.1f}s)"
+                )
+
+    total = time.perf_counter() - t0
+    print(f"✓ 覆盖路径完成：成功 {len(results)}/{n} 块，总耗时 {total:.1f}s")
+    return results
 
 
 def load_coverage_paths_from_files(
@@ -120,6 +340,7 @@ def process_water_block_coverage(
     y_scale_factor: float = 1.0,
     degenerate_threshold: float = 1.0,
     lkh_runs: int = 10,
+    verbose: bool = True,
 ) -> Tuple[Optional[List[float]], Optional[List[List[float]]], Optional[List[int]], Optional[List[float]]]:
     """
     通用：处理第 block_no 块水域的覆盖路径。起点/终点由调用方传入。
@@ -139,8 +360,13 @@ def process_water_block_coverage(
     :param y_scale_factor: Y 轴缩放因子
     :param degenerate_threshold: 起点与退出点距离小于此值时视为同一点，用地图轴生成网格；建议取水域块50的起退点距离
     :param lkh_runs: PAR 中的 RUNS（LKH 运行次数，越大解越优、越慢）
+    :param verbose: 详细日志开关（并行时建议 False）
     :return: (start_point, sampling_points, tour_order, exit_point)
     """
+    def _log(msg):
+        if verbose:
+            print(msg)
+
     out_start = start_point
     out_sampling_points = None
     out_tour_order = None
@@ -154,11 +380,11 @@ def process_water_block_coverage(
     os.makedirs(coverage_paths_dir, exist_ok=True)
 
     if skip_sampling_and_path:
-        print(f"  [提示] 第{block_no}块：跳过采样/成本矩阵/LKH，仅返回起终点。")
+        _log(f"  [提示] 第{block_no}块：跳过采样/成本矩阵/LKH，仅返回起终点。")
         return out_start, None, None, out_exit
 
     try:
-        print(f"  [调试] 第{block_no}块：生成覆盖路径（起点/终点已传入）")
+        _log(f"  [调试] 第{block_no}块：生成覆盖路径（起点/终点已传入）")
 
         boundary_poly = Polygon(env_data["boundary_polygon"]) if env_data.get("boundary_polygon") is not None else None
         sampling_points = generate_water_sampling_points(
@@ -224,14 +450,15 @@ def process_water_block_coverage(
             par_name=par_name,
             solution_name=solution_name,
             output_name=f"{prefix}_tsp_path.txt",
+            verbose=verbose,
         )
 
         if tour_order_raw is None:
             solution_path = os.path.join(data_dir_for_lkh, solution_name)
             if os.path.exists(solution_path):
-                tour_order_raw = parse_lkh_solution(solution_path)
+                tour_order_raw = parse_lkh_solution(solution_path, verbose=verbose)
                 if tour_order_raw is not None:
-                    print(f"  [提示] 第{block_no}块：LKH 未返回结果，使用已有 .tour 文件")
+                    _log(f"  [提示] 第{block_no}块：LKH 未返回结果，使用已有 .tour 文件")
             if tour_order_raw is None:
                 print(f"  ✗ 第{block_no}块：LKH 求解失败")
                 return out_start, sampling_points, out_tour_order, out_exit
@@ -264,6 +491,7 @@ def process_water_block_coverage(
             f.write("TOUR_ORDER:\n")
             f.write(" ".join(map(str, tour_order)) + "\n")
 
+        # 成功保存始终打印，便于确认结果
         print(f"  ✓ 第{block_no}块：覆盖路径已保存 {out_path}")
 
     except Exception as e:
